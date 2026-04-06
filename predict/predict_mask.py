@@ -69,13 +69,16 @@ def get_bottom_quarter_mask(full_mask, h, w):
 
 def get_top_edge_points(bottom_mask, CL, CR):
     """
-    从 bottom_mask 的上边缘逐列扫描，只取 CL.x ~ CR.x 范围内的列，
-    排除左右侧面边缘，只保留顶部边缘点。
+    从 bottom_mask 的上边缘逐列扫描，取掩膜实际像素范围内的列，
+    保留顶部边缘点。
     """
-    x_left = int(round(min(CL[0], CR[0])))
-    x_right = int(round(max(CL[0], CR[0])))
-    x_left = max(x_left, 0)
-    x_right = min(x_right, bottom_mask.shape[1] - 1)
+    # 使用掩膜实际的 x 范围，而非 CL/CR 的 x 坐标（旋转矩形切割点可能偏移）
+    cols_with_pixels = np.any(bottom_mask > 0, axis=0)
+    x_indices = np.where(cols_with_pixels)[0]
+    if len(x_indices) == 0:
+        return []
+    x_left = int(x_indices[0])
+    x_right = int(x_indices[-1])
 
     edge_points = []
     for x in range(x_left, x_right + 1):
@@ -88,39 +91,55 @@ def get_top_edge_points(bottom_mask, CL, CR):
 
 def fit_line_and_sample(edge_points, bottom_mask, num_points=10):
     """
-    对上边缘点集拟合直线，沿拟合线在掩膜内的范围取端点，
-    在直线上均匀采样 num_points 个点。
+    对上边缘点集拟合直线，过滤侧面边缘的离群点，
+    用内点 x 范围确定直线端点，均匀采样 num_points 个点。
     返回 (pt_left, pt_right, sample_points) 或 (None, None, [])
     """
     if len(edge_points) < 2:
         return None, None, []
 
     pts = np.array(edge_points, dtype=np.float32)
-    vx, vy, cx, cy = cv2.fitLine(pts, cv2.DIST_L2, 0, 0.01, 0.01).flatten()
 
-    h, w = bottom_mask.shape
-    x_min, x_max = float(pts[:, 0].min()), float(pts[:, 0].max())
+    # 第一次鲁棒拟合（用 Huber 距离，对离群点不敏感）
+    vx, vy, cx, cy = cv2.fitLine(pts, cv2.DIST_HUBER, 0, 0.01, 0.01).flatten()
 
     if abs(vx) < 1e-6:
         slope = 0.0
     else:
         slope = vy / vx
 
-    # 沿拟合线逐像素检查，找掩膜内的有效范围
-    valid_pts = []
-    num_samples = int(x_max - x_min) + 1
-    for i in range(num_samples):
-        x = x_min + i
-        y = float(cy + slope * (x - cx))
-        xi, yi = int(round(x)), int(round(y))
-        if 0 <= xi < w and 0 <= yi < h and bottom_mask[yi, xi] > 0:
-            valid_pts.append((x, y))
+    # 计算每个边缘点到拟合线的垂直距离
+    y_expected = cy + slope * (pts[:, 0] - cx)
+    abs_residuals = np.abs(pts[:, 1] - y_expected)
 
-    if len(valid_pts) < 2:
-        return None, None, []
+    # 自适应阈值：中位数 + 3 * MAD，最小 5 像素
+    median_res = np.median(abs_residuals)
+    mad = np.median(np.abs(abs_residuals - median_res))
+    threshold = max(median_res + 3.0 * max(mad, 1.0), 5.0)
 
-    pt_left = np.array(valid_pts[0])
-    pt_right = np.array(valid_pts[-1])
+    # 过滤离群点（侧面边缘点偏离拟合线较远）
+    inlier_mask = abs_residuals <= threshold
+    inlier_pts = pts[inlier_mask]
+
+    if len(inlier_pts) < 2:
+        inlier_pts = pts
+
+    # 用内点重新拟合
+    vx, vy, cx, cy = cv2.fitLine(inlier_pts, cv2.DIST_L2, 0, 0.01, 0.01).flatten()
+    if abs(vx) < 1e-6:
+        slope = 0.0
+    else:
+        slope = vy / vx
+
+    # 用内点的 x 范围确定直线端点
+    x_min = float(inlier_pts[:, 0].min())
+    x_max = float(inlier_pts[:, 0].max())
+
+    y_left = float(cy + slope * (x_min - cx))
+    y_right = float(cy + slope * (x_max - cx))
+
+    pt_left = np.array([x_min, y_left])
+    pt_right = np.array([x_max, y_right])
 
     # 在直线端点之间均匀采样
     sample_pts = []
