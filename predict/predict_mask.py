@@ -22,7 +22,7 @@ if not image_files:
 
 def get_bottom_quarter_mask(full_mask, h, w):
     """
-    基于最小旋转矩形的边识别底边，求掩膜底部 1/4 区域（平行四边形切割）。
+    基于最小旋转矩形，按 y 排序角点，求掩膜底部 1/4 区域。
     返回 (bottom_mask, BL, BR)。
     """
     # 找到掩膜轮廓
@@ -35,30 +35,21 @@ def get_bottom_quarter_mask(full_mask, h, w):
 
     # 求最小面积旋转矩形，获取四个角点
     rect = cv2.minAreaRect(cnt)
-    box = cv2.boxPoints(rect)  # 4 个角点，shape (4, 2)，相邻角点共享一条边
+    box = cv2.boxPoints(rect)  # 4 个角点，shape (4, 2)
 
-    # 基于边识别底边：计算 4 条边的平均 y，取最大的为底边
-    edges = [(0, 1), (1, 2), (2, 3), (3, 0)]
-    avg_ys = [(box[i][1] + box[j][1]) / 2.0 for i, j in edges]
-    bottom_edge_idx = int(np.argmax(avg_ys))
-    bi, bj = edges[bottom_edge_idx]
+    # 按 y 坐标排序：y 较小的两点为顶部，y 较大的两点为底部
+    sorted_by_y = box[np.argsort(box[:, 1])]
+    top_pts = sorted_by_y[:2]
+    bottom_pts = sorted_by_y[2:]
 
-    # 底边两端点按 x 排序为 BL（左）、BR（右）
-    if box[bi][0] <= box[bj][0]:
-        BL, BR = box[bi].copy(), box[bj].copy()
-        bl_idx, br_idx = bi, bj
-    else:
-        BL, BR = box[bj].copy(), box[bi].copy()
-        bl_idx, br_idx = bj, bi
+    # 按 x 排序区分左右
+    top_pts = top_pts[np.argsort(top_pts[:, 0])]
+    bottom_pts = bottom_pts[np.argsort(bottom_pts[:, 0])]
 
-    # 通过邻接关系找到 TL（与 BL 相邻且非 BR）和 TR（与 BR 相邻且非 BL）
-    neighbors_bl = [(bl_idx - 1) % 4, (bl_idx + 1) % 4]
-    TL = box[[n for n in neighbors_bl if n != br_idx][0]]
+    TL, TR = top_pts[0].copy(), top_pts[1].copy()
+    BL, BR = bottom_pts[0].copy(), bottom_pts[1].copy()
 
-    neighbors_br = [(br_idx - 1) % 4, (br_idx + 1) % 4]
-    TR = box[[n for n in neighbors_br if n != bl_idx][0]]
-
-    # 在 75% 处沿侧边插值得到切割线端点（平行四边形）
+    # 在 75% 处沿侧边插值得到切割线端点
     CL = TL + 0.75 * (BL - TL)
     CR = TR + 0.75 * (BR - TR)
 
@@ -98,58 +89,68 @@ def get_top_edge_points(bottom_mask):
 
 def fit_line_and_sample(edge_points, BL, BR, num_points=10):
     """
-    固定底边方向拟合：方向锁定为 BR-BL，仅拟合法向偏移量（中位数），
-    用自适应离群点过滤确定线段端点，均匀采样 num_points 个点。
+    Huber 鲁棒拟合 + 自适应离群点过滤 + 内点 x 范围确定线段端点，
+    均匀采样 num_points 个点。
     返回 (pt_left, pt_right, sample_points) 或 (None, None, [])
     """
-    if len(edge_points) < 2 or BL is None or BR is None:
+    if len(edge_points) < 2:
         return None, None, []
 
-    pts = np.array(edge_points, dtype=np.float64)
-    BL = BL.astype(np.float64)
-    BR = BR.astype(np.float64)
+    pts = np.array(edge_points, dtype=np.float32).reshape(-1, 1, 2)
 
-    # 底边方向向量，归一化
-    d = BR - BL
+    # Huber 鲁棒拟合
+    line = cv2.fitLine(pts, cv2.DIST_HUBER, 0, 0.01, 0.01)
+    vx, vy, x0, y0 = line.flatten()
+
+    # 方向单位向量
+    d = np.array([vx, vy], dtype=np.float64)
     d_len = np.linalg.norm(d)
     if d_len < 1e-6:
         return None, None, []
-    d_hat = d / d_len
 
-    # 法向量（指向上方）
-    n_hat = np.array([-d_hat[1], d_hat[0]])
-    if n_hat[1] > 0:  # 确保指向上方（y 减小方向）
-        n_hat = -n_hat
+    # 每个点到拟合线的垂直残差（绝对值）
+    pts_flat = np.array(edge_points, dtype=np.float64)
+    p0 = np.array([x0, y0], dtype=np.float64)
+    if abs(vx) < 1e-6:
+        abs_residuals = np.abs(pts_flat[:, 0] - x0)
+    else:
+        slope = vy / vx
+        abs_residuals = np.abs(pts_flat[:, 1] - (y0 + slope * (pts_flat[:, 0] - x0)))
 
-    # 每个边缘点相对 BL 的偏移
-    deltas = pts - BL  # (N, 2)
-
-    # 法向投影（到底边的法向距离）
-    t = deltas @ n_hat  # (N,)
-    # 底边方向投影
-    s = deltas @ d_hat  # (N,)
-
-    # 法向偏移取中位数（鲁棒）
-    t_med = float(np.median(t))
-
-    # 自适应离群点过滤（基于法向残差）
-    abs_residuals = np.abs(t - t_med)
-    median_res = np.median(abs_residuals)
-    mad = np.median(np.abs(abs_residuals - median_res))
-    threshold = max(median_res + 3.0 * max(mad, 1.0), 5.0)
-
+    # 自适应离群点过滤（中位数 + 3×MAD）
+    med_r = np.median(abs_residuals)
+    mad = max(np.median(np.abs(abs_residuals - med_r)), 1.0)
+    threshold = max(med_r + 3.0 * mad, 5.0)
     inlier_mask = abs_residuals <= threshold
-    s_inliers = s[inlier_mask]
 
-    if len(s_inliers) < 2:
-        s_inliers = s
+    # 内点
+    inlier_pts = pts_flat[inlier_mask]
+    if len(inlier_pts) < 2:
+        inlier_pts = pts_flat
 
-    s_min = float(s_inliers.min())
-    s_max = float(s_inliers.max())
+    # 第二阶段：用内点重新做 L2 最小二乘拟合
+    inlier_pts_cv = inlier_pts.astype(np.float32).reshape(-1, 1, 2)
+    line2 = cv2.fitLine(inlier_pts_cv, cv2.DIST_L2, 0, 0.01, 0.01)
+    vx2, vy2, x02, y02 = line2.flatten()
+    d2 = np.array([vx2, vy2], dtype=np.float64)
+    p02 = np.array([x02, y02], dtype=np.float64)
 
-    # 端点
-    pt_left = BL + s_min * d_hat + t_med * n_hat
-    pt_right = BL + s_max * d_hat + t_med * n_hat
+    # 内点的 x 坐标范围
+    x_min = float(inlier_pts[:, 0].min())
+    x_max = float(inlier_pts[:, 0].max())
+
+    # 线段端点：在 L2 拟合线上对应 x_min 和 x_max 的位置
+    if abs(vx2) < 1e-6:
+        # 近似垂直线
+        y_min = float(inlier_pts[:, 1].min())
+        y_max = float(inlier_pts[:, 1].max())
+        pt_left = np.array([x02, y_min])
+        pt_right = np.array([x02, y_max])
+    else:
+        t_left = (x_min - x02) / vx2
+        t_right = (x_max - x02) / vx2
+        pt_left = p02 + t_left * d2
+        pt_right = p02 + t_right * d2
 
     # 均匀采样
     sample_pts = []
