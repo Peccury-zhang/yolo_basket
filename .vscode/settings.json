@@ -1,4 +1,17 @@
 {
     "python-envs.defaultEnvManager": "ms-python.python:conda",
-    "python-envs.defaultPackageManager": "ms-python.python:conda"
+    "python-envs.defaultPackageManager": "ms-python.python:conda",
+    "ROS2.distro": "jazzy",
+    "python.autoComplete.extraPaths": [
+        "/home/yclab/ycrobot_ws/install/select_image/lib/python3.12/site-packages",
+        "/home/yclab/ycrobot_ws/install/detect_basket/lib/python3.12/site-packages",
+        "/home/yclab/ycrobot_ws/install/detect_basket_msgs/lib/python3.12/site-packages",
+        "/opt/ros/jazzy/lib/python3.12/site-packages"
+    ],
+    "python.analysis.extraPaths": [
+        "/home/yclab/ycrobot_ws/install/select_image/lib/python3.12/site-packages",
+        "/home/yclab/ycrobot_ws/install/detect_basket/lib/python3.12/site-packages",
+        "/home/yclab/ycrobot_ws/install/detect_basket_msgs/lib/python3.12/site-packages",
+        "/opt/ros/jazzy/lib/python3.12/site-packages"
+    ]
 }
