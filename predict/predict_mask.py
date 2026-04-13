@@ -22,35 +22,43 @@ if not image_files:
 
 def get_bottom_quarter_mask(full_mask, h, w):
     """
-    基于最小旋转矩形，求掩膜底部 1/4 区域。
-    返回底部 1/4 的二值 mask。
+    基于最小旋转矩形的边识别底边，求掩膜底部 1/4 区域（平行四边形切割）。
+    返回 (bottom_mask, BL, BR)。
     """
     # 找到掩膜轮廓
     contours, _ = cv2.findContours(full_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
-        return np.zeros((h, w), dtype=np.uint8)
+        return np.zeros((h, w), dtype=np.uint8), None, None
 
     # 取最大轮廓
     cnt = max(contours, key=cv2.contourArea)
 
     # 求最小面积旋转矩形，获取四个角点
     rect = cv2.minAreaRect(cnt)
-    box = cv2.boxPoints(rect)  # 4 个角点，shape (4, 2)
+    box = cv2.boxPoints(rect)  # 4 个角点，shape (4, 2)，相邻角点共享一条边
 
-    # 将四个角点按 y 坐标排序，分为顶部两点和底部两点
-    sorted_by_y = box[np.argsort(box[:, 1])]
-    top_pts = sorted_by_y[:2]   # y 较小的两个点（顶部）
-    bot_pts = sorted_by_y[2:]   # y 较大的两个点（底部）
+    # 基于边识别底边：计算 4 条边的平均 y，取最大的为底边
+    edges = [(0, 1), (1, 2), (2, 3), (3, 0)]
+    avg_ys = [(box[i][1] + box[j][1]) / 2.0 for i, j in edges]
+    bottom_edge_idx = int(np.argmax(avg_ys))
+    bi, bj = edges[bottom_edge_idx]
 
-    # 顶部两点按 x 排序：左、右
-    top_pts = top_pts[np.argsort(top_pts[:, 0])]
-    TL, TR = top_pts[0], top_pts[1]
+    # 底边两端点按 x 排序为 BL（左）、BR（右）
+    if box[bi][0] <= box[bj][0]:
+        BL, BR = box[bi].copy(), box[bj].copy()
+        bl_idx, br_idx = bi, bj
+    else:
+        BL, BR = box[bj].copy(), box[bi].copy()
+        bl_idx, br_idx = bj, bi
 
-    # 底部两点按 x 排序：左、右
-    bot_pts = bot_pts[np.argsort(bot_pts[:, 0])]
-    BL, BR = bot_pts[0], bot_pts[1]
+    # 通过邻接关系找到 TL（与 BL 相邻且非 BR）和 TR（与 BR 相邻且非 BL）
+    neighbors_bl = [(bl_idx - 1) % 4, (bl_idx + 1) % 4]
+    TL = box[[n for n in neighbors_bl if n != br_idx][0]]
 
-    # 在 75% 处插值得到切割线端点
+    neighbors_br = [(br_idx - 1) % 4, (br_idx + 1) % 4]
+    TR = box[[n for n in neighbors_br if n != bl_idx][0]]
+
+    # 在 75% 处沿侧边插值得到切割线端点（平行四边形）
     CL = TL + 0.75 * (BL - TL)
     CR = TR + 0.75 * (BR - TR)
 
@@ -64,15 +72,14 @@ def get_bottom_quarter_mask(full_mask, h, w):
     # 与原始掩膜取交集
     bottom_mask = cv2.bitwise_and(full_mask, cut_mask)
 
-    return bottom_mask, CL, CR
+    return bottom_mask, BL, BR
 
 
-def get_top_edge_points(bottom_mask, CL, CR):
+def get_top_edge_points(bottom_mask):
     """
     从 bottom_mask 的上边缘逐列扫描，取掩膜实际像素范围内的列，
     保留顶部边缘点。
     """
-    # 使用掩膜实际的 x 范围，而非 CL/CR 的 x 坐标（旋转矩形切割点可能偏移）
     cols_with_pixels = np.any(bottom_mask > 0, axis=0)
     x_indices = np.where(cols_with_pixels)[0]
     if len(x_indices) == 0:
@@ -89,63 +96,66 @@ def get_top_edge_points(bottom_mask, CL, CR):
     return edge_points
 
 
-def fit_line_and_sample(edge_points, bottom_mask, num_points=10):
+def fit_line_and_sample(edge_points, BL, BR, num_points=10):
     """
-    对上边缘点集拟合直线，过滤侧面边缘的离群点，
-    用内点 x 范围确定直线端点，均匀采样 num_points 个点。
+    固定底边方向拟合：方向锁定为 BR-BL，仅拟合法向偏移量（中位数），
+    用自适应离群点过滤确定线段端点，均匀采样 num_points 个点。
     返回 (pt_left, pt_right, sample_points) 或 (None, None, [])
     """
-    if len(edge_points) < 2:
+    if len(edge_points) < 2 or BL is None or BR is None:
         return None, None, []
 
-    pts = np.array(edge_points, dtype=np.float32)
+    pts = np.array(edge_points, dtype=np.float64)
+    BL = BL.astype(np.float64)
+    BR = BR.astype(np.float64)
 
-    # 第一次鲁棒拟合（用 Huber 距离，对离群点不敏感）
-    vx, vy, cx, cy = cv2.fitLine(pts, cv2.DIST_HUBER, 0, 0.01, 0.01).flatten()
+    # 底边方向向量，归一化
+    d = BR - BL
+    d_len = np.linalg.norm(d)
+    if d_len < 1e-6:
+        return None, None, []
+    d_hat = d / d_len
 
-    if abs(vx) < 1e-6:
-        slope = 0.0
-    else:
-        slope = vy / vx
+    # 法向量（指向上方）
+    n_hat = np.array([-d_hat[1], d_hat[0]])
+    if n_hat[1] > 0:  # 确保指向上方（y 减小方向）
+        n_hat = -n_hat
 
-    # 计算每个边缘点到拟合线的垂直距离
-    y_expected = cy + slope * (pts[:, 0] - cx)
-    abs_residuals = np.abs(pts[:, 1] - y_expected)
+    # 每个边缘点相对 BL 的偏移
+    deltas = pts - BL  # (N, 2)
 
-    # 自适应阈值：中位数 + 3 * MAD，最小 5 像素
+    # 法向投影（到底边的法向距离）
+    t = deltas @ n_hat  # (N,)
+    # 底边方向投影
+    s = deltas @ d_hat  # (N,)
+
+    # 法向偏移取中位数（鲁棒）
+    t_med = float(np.median(t))
+
+    # 自适应离群点过滤（基于法向残差）
+    abs_residuals = np.abs(t - t_med)
     median_res = np.median(abs_residuals)
     mad = np.median(np.abs(abs_residuals - median_res))
     threshold = max(median_res + 3.0 * max(mad, 1.0), 5.0)
 
-    # 过滤离群点（侧面边缘点偏离拟合线较远）
     inlier_mask = abs_residuals <= threshold
-    inlier_pts = pts[inlier_mask]
+    s_inliers = s[inlier_mask]
 
-    if len(inlier_pts) < 2:
-        inlier_pts = pts
+    if len(s_inliers) < 2:
+        s_inliers = s
 
-    # 用内点重新拟合
-    vx, vy, cx, cy = cv2.fitLine(inlier_pts, cv2.DIST_L2, 0, 0.01, 0.01).flatten()
-    if abs(vx) < 1e-6:
-        slope = 0.0
-    else:
-        slope = vy / vx
+    s_min = float(s_inliers.min())
+    s_max = float(s_inliers.max())
 
-    # 用内点的 x 范围确定直线端点
-    x_min = float(inlier_pts[:, 0].min())
-    x_max = float(inlier_pts[:, 0].max())
+    # 端点
+    pt_left = BL + s_min * d_hat + t_med * n_hat
+    pt_right = BL + s_max * d_hat + t_med * n_hat
 
-    y_left = float(cy + slope * (x_min - cx))
-    y_right = float(cy + slope * (x_max - cx))
-
-    pt_left = np.array([x_min, y_left])
-    pt_right = np.array([x_max, y_right])
-
-    # 在直线端点之间均匀采样
+    # 均匀采样
     sample_pts = []
     for i in range(num_points):
-        t = i / (num_points - 1)
-        pt = pt_left + t * (pt_right - pt_left)
+        frac = i / (num_points - 1)
+        pt = pt_left + frac * (pt_right - pt_left)
         sample_pts.append((int(round(pt[0])), int(round(pt[1]))))
 
     return pt_left, pt_right, sample_pts
@@ -195,8 +205,8 @@ for image_path in image_files:
         cv2.fillPoly(full_mask, [pts], 255)
 
         # 基于旋转矩形求底部 1/4
-        bottom_mask, CL, CR = get_bottom_quarter_mask(full_mask, h, w)
-        all_bottom_masks.append((bottom_mask, CL, CR))
+        bottom_mask, BL, BR = get_bottom_quarter_mask(full_mask, h, w)
+        all_bottom_masks.append((bottom_mask, BL, BR))
 
         # 提取下方 1/4 的轮廓
         contours, _ = cv2.findContours(bottom_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -211,9 +221,9 @@ for image_path in image_files:
     # 对每个底部 1/4 mask，拟合上边缘直线并均匀采样 10 个点
     points_txt_path = output_dir / f'{stem}_points.txt'
     all_sample_points = []
-    for i, (bm, CL, CR) in enumerate(all_bottom_masks):
-        edge_pts = get_top_edge_points(bm, CL, CR)
-        pt_left, pt_right, sample_pts = fit_line_and_sample(edge_pts, bm, num_points=10)
+    for i, (bm, BL, BR) in enumerate(all_bottom_masks):
+        edge_pts = get_top_edge_points(bm)
+        pt_left, pt_right, sample_pts = fit_line_and_sample(edge_pts, BL, BR, num_points=10)
         if pt_left is None:
             all_sample_points.append([])
             continue
