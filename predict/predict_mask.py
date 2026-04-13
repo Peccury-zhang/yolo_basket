@@ -56,9 +56,31 @@ def _approx_quadrilateral(cnt):
     return None
 
 
+def _build_below_line_mask(point_a, point_b, reference_point, h, w):
+    """
+    构造经过 point_a -> point_b 的直线下方半平面 mask。
+    通过 reference_point 指定需要保留的那一侧，避免依赖直线方向。
+    """
+    ax, ay = point_a
+    bx, by = point_b
+    rx, ry = reference_point
+
+    yy, xx = np.ogrid[:h, :w]
+    cross = (bx - ax) * (yy - ay) - (by - ay) * (xx - ax)
+    ref_cross = (bx - ax) * (ry - ay) - (by - ay) * (rx - ax)
+
+    if ref_cross >= 0:
+        keep = cross >= 0
+    else:
+        keep = cross <= 0
+
+    return (keep.astype(np.uint8) * 255)
+
+
 def get_bottom_quarter_mask(full_mask, h, w):
     """
     基于四边形拟合（approxPolyDP），按 y 排序角点，求掩膜底部 1/4 区域。
+    上边界使用 75% 插值线，下边界跟随原始掩膜。
     若四边形拟合失败，退回 minAreaRect 方案。
     返回 (bottom_mask, BL, BR)。
     """
@@ -95,12 +117,9 @@ def get_bottom_quarter_mask(full_mask, h, w):
     CL = TL + 0.75 * (BL - TL)
     CR = TR + 0.75 * (BR - TR)
 
-    # 构造底部 1/4 四边形：CL -> CR -> BR -> BL
-    cut_quad = np.array([CL, CR, BR, BL], dtype=np.int32)
-
-    # 绘制切割四边形为二值 mask
-    cut_mask = np.zeros((h, w), dtype=np.uint8)
-    cv2.fillPoly(cut_mask, [cut_quad], 255)
+    # 仅使用上切割线裁切，保留该线下方的原始掩膜区域
+    bottom_reference = 0.5 * (BL + BR)
+    cut_mask = _build_below_line_mask(CL, CR, bottom_reference, h, w)
 
     # 与原始掩膜取交集
     bottom_mask = cv2.bitwise_and(full_mask, cut_mask)
