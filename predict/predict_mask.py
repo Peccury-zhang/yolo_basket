@@ -20,9 +20,46 @@ if not image_files:
     exit()
 
 
+def _approx_quadrilateral(cnt):
+    """
+    对轮廓做凸包 + approxPolyDP，逐步增大 epsilon 直到近似为 4 个顶点。
+    返回 4 个角点 (shape (4,2))，失败则返回 None。
+    """
+    hull = cv2.convexHull(cnt)
+    peri = cv2.arcLength(hull, True)
+
+    # 从 0.5% 开始逐步增大 epsilon，步长 0.5%，上限 10%
+    last_approx = None
+    for pct in np.arange(0.005, 0.101, 0.005):
+        approx = cv2.approxPolyDP(hull, pct * peri, True)
+        n = len(approx)
+        if n == 4:
+            return approx.reshape(4, 2).astype(np.float64)
+        if n > 4:
+            last_approx = approx
+        elif n < 4 and last_approx is not None:
+            # 从上次 >4 的结果中选出 4 个顶点：按角点间弧长最大的 4 个保留
+            pts = last_approx.reshape(-1, 2).astype(np.float64)
+            # 用凸包面积贡献来选：逐个移除使面积减少最小的点，直到剩 4 个
+            while len(pts) > 4:
+                min_loss = float('inf')
+                remove_idx = 0
+                for i in range(len(pts)):
+                    reduced = np.delete(pts, i, axis=0)
+                    area = cv2.contourArea(reduced.astype(np.float32))
+                    loss = cv2.contourArea(pts.astype(np.float32)) - area
+                    if loss < min_loss:
+                        min_loss = loss
+                        remove_idx = i
+                pts = np.delete(pts, remove_idx, axis=0)
+            return pts
+    return None
+
+
 def get_bottom_quarter_mask(full_mask, h, w):
     """
-    基于最小旋转矩形，按 y 排序角点，求掩膜底部 1/4 区域。
+    基于四边形拟合（approxPolyDP），按 y 排序角点，求掩膜底部 1/4 区域。
+    若四边形拟合失败，退回 minAreaRect 方案。
     返回 (bottom_mask, BL, BR)。
     """
     # 找到掩膜轮廓
@@ -33,9 +70,14 @@ def get_bottom_quarter_mask(full_mask, h, w):
     # 取最大轮廓
     cnt = max(contours, key=cv2.contourArea)
 
-    # 求最小面积旋转矩形，获取四个角点
-    rect = cv2.minAreaRect(cnt)
-    box = cv2.boxPoints(rect)  # 4 个角点，shape (4, 2)
+    # 尝试四边形拟合
+    quad = _approx_quadrilateral(cnt)
+    if quad is not None:
+        box = quad
+    else:
+        # fallback: 最小旋转矩形
+        rect = cv2.minAreaRect(cnt)
+        box = cv2.boxPoints(rect).astype(np.float64)
 
     # 按 y 坐标排序：y 较小的两点为顶部，y 较大的两点为底部
     sorted_by_y = box[np.argsort(box[:, 1])]
