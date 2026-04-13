@@ -2,3 +2,4 @@
 /predict/output_image/*
 /predict/runs
 /.vscode
+predict/output_img/
