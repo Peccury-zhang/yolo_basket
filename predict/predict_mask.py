@@ -77,6 +77,144 @@ def _build_below_line_mask(point_a, point_b, reference_point, h, w):
     return (keep.astype(np.uint8) * 255)
 
 
+def _line_intersection(point1, direction1, point2, direction2):
+    """
+    计算两条参数直线的交点；若近似平行则返回 None。
+    """
+    matrix = np.array(
+        [[direction1[0], -direction2[0]], [direction1[1], -direction2[1]]],
+        dtype=np.float64,
+    )
+    det = np.linalg.det(matrix)
+    if abs(det) < 1e-6:
+        return None
+
+    rhs = np.array(point2, dtype=np.float64) - np.array(point1, dtype=np.float64)
+    t, _ = np.linalg.solve(matrix, rhs)
+    return np.array(point1, dtype=np.float64) + t * np.array(direction1, dtype=np.float64)
+
+
+def _extract_bottom_edge_points(full_mask, trim_ratio=0.08):
+    """
+    逐列提取掩膜最底部像素，并裁掉左右两端的一小段，减少侧边凸起干扰。
+    """
+    cols_with_pixels = np.any(full_mask > 0, axis=0)
+    x_indices = np.where(cols_with_pixels)[0]
+    if len(x_indices) < 2:
+        return np.empty((0, 2), dtype=np.float64)
+
+    x_left = int(x_indices[0])
+    x_right = int(x_indices[-1])
+    width = x_right - x_left + 1
+    trim = int(round(width * trim_ratio))
+    x_start = x_left + trim
+    x_end = x_right - trim
+
+    if x_end <= x_start:
+        x_start = x_left
+        x_end = x_right
+
+    points = []
+    for x in range(x_start, x_end + 1):
+        ys = np.where(full_mask[:, x] > 0)[0]
+        if len(ys) > 0:
+            points.append((x, int(ys[-1])))
+    return np.array(points, dtype=np.float64)
+
+
+def _fit_robust_line(points):
+    """
+    Huber + MAD 过滤后再用 L2 拟合直线。
+    返回 (线上一点 p, 单位方向向量 d)，失败返回 (None, None)。
+    """
+    if len(points) < 2:
+        return None, None
+
+    pts_cv = points.astype(np.float32).reshape(-1, 1, 2)
+    line = cv2.fitLine(pts_cv, cv2.DIST_HUBER, 0, 0.01, 0.01)
+    vx, vy, x0, y0 = line.flatten()
+
+    direction = np.array([vx, vy], dtype=np.float64)
+    norm = np.linalg.norm(direction)
+    if norm < 1e-6:
+        return None, None
+    direction /= norm
+    normal = np.array([-direction[1], direction[0]], dtype=np.float64)
+    point_on_line = np.array([x0, y0], dtype=np.float64)
+
+    signed_distances = (points - point_on_line) @ normal
+    abs_distances = np.abs(signed_distances)
+    median_distance = np.median(abs_distances)
+    mad = max(np.median(np.abs(abs_distances - median_distance)), 1.0)
+    threshold = max(median_distance + 3.0 * mad, 3.0)
+    inlier_mask = abs_distances <= threshold
+    inlier_points = points[inlier_mask]
+    if len(inlier_points) < 2:
+        inlier_points = points
+
+    inlier_pts_cv = inlier_points.astype(np.float32).reshape(-1, 1, 2)
+    line2 = cv2.fitLine(inlier_pts_cv, cv2.DIST_L2, 0, 0.01, 0.01)
+    vx2, vy2, x02, y02 = line2.flatten()
+    direction2 = np.array([vx2, vy2], dtype=np.float64)
+    norm2 = np.linalg.norm(direction2)
+    if norm2 < 1e-6:
+        return None, None
+    direction2 /= norm2
+    if direction2[0] < 0:
+        direction2 = -direction2
+
+    return np.array([x02, y02], dtype=np.float64), direction2
+
+
+def _build_parallel_band_mask(full_mask, quad_points, top_points, h, w):
+    """
+    基于鲁棒底边拟合，构造上下边平行、厚度尽量一致的梯形带。
+    """
+    TL, TR, BL, BR = quad_points
+    CL, CR = top_points
+
+    bottom_edge_points = _extract_bottom_edge_points(full_mask)
+    bottom_point, bottom_direction = _fit_robust_line(bottom_edge_points)
+    if bottom_point is None:
+        return None
+
+    bottom_normal = np.array([-bottom_direction[1], bottom_direction[0]], dtype=np.float64)
+    top_mid = 0.5 * (TL + TR)
+    top_side_sign = np.sign(np.dot(top_mid - bottom_point, bottom_normal))
+    if top_side_sign == 0:
+        top_side_sign = -1.0
+
+    distance_cl = abs(np.dot(CL - bottom_point, bottom_normal))
+    distance_cr = abs(np.dot(CR - bottom_point, bottom_normal))
+    band_thickness = max(0.5 * (distance_cl + distance_cr), 6.0)
+    bottom_padding = 4.0
+
+    adjusted_bottom_point = bottom_point - top_side_sign * bottom_padding * bottom_normal
+    top_line_point = adjusted_bottom_point + top_side_sign * band_thickness * bottom_normal
+
+    left_direction = BL - TL
+    right_direction = BR - TR
+    top_left = _line_intersection(top_line_point, bottom_direction, TL, left_direction)
+    top_right = _line_intersection(top_line_point, bottom_direction, TR, right_direction)
+    bottom_left = _line_intersection(adjusted_bottom_point, bottom_direction, TL, left_direction)
+    bottom_right = _line_intersection(adjusted_bottom_point, bottom_direction, TR, right_direction)
+
+    if any(point is None for point in (top_left, top_right, bottom_left, bottom_right)):
+        return None
+
+    band_polygon = np.array([top_left, top_right, bottom_right, bottom_left], dtype=np.int32)
+    band_mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillPoly(band_mask, [band_polygon], 255)
+
+    smooth_mask = cv2.morphologyEx(
+        full_mask,
+        cv2.MORPH_CLOSE,
+        np.ones((5, 5), dtype=np.uint8),
+    )
+    smooth_mask = cv2.dilate(smooth_mask, np.ones((3, 3), dtype=np.uint8), iterations=1)
+    return cv2.bitwise_and(smooth_mask, band_mask)
+
+
 def get_bottom_quarter_mask(full_mask, h, w):
     """
     基于四边形拟合（approxPolyDP），按 y 排序角点，求掩膜底部 1/4 区域。
@@ -117,12 +255,20 @@ def get_bottom_quarter_mask(full_mask, h, w):
     CL = TL + 0.75 * (BL - TL)
     CR = TR + 0.75 * (BR - TR)
 
-    # 仅使用上切割线裁切，保留该线下方的原始掩膜区域
-    bottom_reference = 0.5 * (BL + BR)
-    cut_mask = _build_below_line_mask(CL, CR, bottom_reference, h, w)
-
-    # 与原始掩膜取交集
-    bottom_mask = cv2.bitwise_and(full_mask, cut_mask)
+    band_mask = _build_parallel_band_mask(
+        full_mask,
+        (TL, TR, BL, BR),
+        (CL, CR),
+        h,
+        w,
+    )
+    if band_mask is not None and cv2.countNonZero(band_mask) > 0:
+        bottom_mask = band_mask
+    else:
+        # fallback: 退回 v8 的半平面裁切
+        bottom_reference = 0.5 * (BL + BR)
+        cut_mask = _build_below_line_mask(CL, CR, bottom_reference, h, w)
+        bottom_mask = cv2.bitwise_and(full_mask, cut_mask)
 
     return bottom_mask, BL, BR
 
